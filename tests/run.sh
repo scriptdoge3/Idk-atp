@@ -30,4 +30,6 @@ echo "== bsp =="
 ./build/bsp_test "$G/MAPS/Room.BSP"
 ./build/bsp2obj -g "$G" maps/room.bsp "$T/room.obj"
 python3 tests/check_obj.py "$T/room.obj"
+./build/bsp2obj -l -g "$G" maps/room.bsp "$T/room_lit.obj" > /dev/null
+python3 tests/check_obj.py "$T/room_lit.obj" --lightmap
 echo "all tests passed"

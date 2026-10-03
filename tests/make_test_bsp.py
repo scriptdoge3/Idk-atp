@@ -11,7 +11,13 @@ They're stored with opposite windings and start their grids at different
 corners; both sample one height field, so a correct loader closes the seam.
 A third dispinfo points at a face that isn't a displacement and must be
 rejected.
+
+The floor and the first displacement are lit by two light styles, and the
+displacement is bump-lit too (four lightmaps per style). Every luxel encodes its own (x, y), style and
+bump index, and each face's average colors sit before its lightofs as
+decoys the reader must skip.
 """
+import math
 import struct
 import sys
 
@@ -30,6 +36,18 @@ DISPS = [  # (corners in stored order, index of the corner the grid starts at, r
     ([(-32, -16, DISP_Z), (-32, 16, DISP_Z), (0, 16, DISP_Z), (0, -16, DISP_Z)], 2, False),
     ([(0, -16, DISP_Z), (32, -16, DISP_Z), (32, 16, DISP_Z), (0, 16, DISP_Z)], 1, True),
 ]
+
+
+# Lit texinfos: one luxel per 16 units. The 0.5 offset and the z terms make
+# face extents start off luxel boundaries and depend on the base height.
+LIGHTMAP_VECS = ((1 / 16, 0, 1 / 64, 0.5), (0, 1 / 16, 1 / 32, 0))
+TEXINFO_LIT, TEXINFO_LIT_BUMP = 2, 3
+STYLE_NUMBERS = (0, 5, 9, 11)
+
+
+def luxel(x, y, style, bump):
+    """ColorRGBExp32 with exponent 1, so the linear color is 2 * byte / 255."""
+    return struct.pack("<3Bb", 12 * x, 12 * y, 50 * style + 10 * bump + 5, 1)
 
 
 def disp_height(x, y):
@@ -55,8 +73,9 @@ def disp_grid(corners, start):
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else "room.bsp"
     planes, verts, edges, surfedges, faces = [], [], [(0, 0)], [], []
+    lighting = bytearray()
 
-    def add_face(normal, dist, side, corners, texinfo, dispinfo, reverse_edges):
+    def add_face(normal, dist, side, corners, texinfo, dispinfo, reverse_edges, light=None):
         planes.append(struct.pack("<3ffi", *normal, dist, 0))
         first_vert = len(verts)
         verts.extend(corners)
@@ -70,12 +89,30 @@ def main():
             else:
                 edges.append((a, b))
                 surfedges.append(len(edges) - 1)
+
+        styles, lightofs, mins, size = (0, 255, 255, 255), -1, (0, 0), (0, 0)
+        if light:  # (number of styles, bump-lit)
+            num_styles, bumped = light
+            proj = [[sum(a * p for a, p in zip(vec[:3], c)) + vec[3] for c in corners]
+                    for vec in LIGHTMAP_VECS]
+            mins = [math.floor(min(e)) for e in proj]
+            size = [math.ceil(max(e)) - m for e, m in zip(proj, mins)]
+            lighting.extend(b"\xee" * 4 * num_styles)  # average color per style
+            lightofs = len(lighting)
+            for style in range(num_styles):
+                for bump in range(4 if bumped else 1):
+                    for y in range(size[1] + 1):
+                        for x in range(size[0] + 1):
+                            lighting.extend(luxel(x, y, style, bump))
+            styles = STYLE_NUMBERS[:num_styles] + (255,) * (4 - num_styles)
         faces.append(struct.pack("<HBBihhhh4Bif2i2iiHHI", len(planes) - 1, side, 0,
-                                 first_edge, n, texinfo, dispinfo, -1, 0, 255, 255, 255,
-                                 -1, 0.0, 0, 0, 0, 0, -1, 0, 0, 0))
+                                 first_edge, n, texinfo, dispinfo, -1, *styles,
+                                 lightofs, 0.0, *mins, *size, -1, 0, 0, 0))
 
     for i, (normal, dist, side, corners) in enumerate(ROOM):
-        add_face(normal, dist, side, corners, 0, -1, reverse_edges=(i % 2 == 1))
+        floor = i == 0
+        add_face(normal, dist, side, corners, TEXINFO_LIT if floor else 0, -1,
+                 reverse_edges=(i % 2 == 1), light=(2, False) if floor else None)
     nodraw_face = len(faces)
     add_face((0, 0, 1), 0.0, 0, [(-8, -8, 0), (8, -8, 0), (8, 8, 0), (-8, 8, 0)], 1, -1,
              reverse_edges=False)
@@ -83,7 +120,9 @@ def main():
     dispinfos, dispverts = [], []
     for i, (corners, start, reverse) in enumerate(DISPS):
         map_face = len(faces)
-        add_face((0, 0, 1), DISP_Z, 0, corners, 0, i, reverse_edges=reverse)
+        lit = i == 0
+        add_face((0, 0, 1), DISP_Z, 0, corners, TEXINFO_LIT_BUMP if lit else 0, i,
+                 reverse_edges=reverse, light=(2, True) if lit else None)
         # startPosition is the grid's first corner, nudged off it a little.
         start_pos = (corners[start][0] + 0.5, corners[start][1] - 0.25, DISP_Z + 0.1)
         dispinfos.append((start_pos, len(dispverts), map_face))
@@ -111,8 +150,11 @@ def main():
            + struct.pack("<3fiiiii", 0.0, 0.0, 0.0, 1, 64, 64, 64, 64),
         3: b"".join(struct.pack("<3f", *v) for v in verts),
         6: struct.pack("<8f8fii", 1, 0, 0, 0, 0, -1, 0, 0, *([0.0] * 8), 0, 0)
-           + struct.pack("<8f8fii", 1, 0, 0, 0, 0, -1, 0, 0, *([0.0] * 8), 0x80, 1),
+           + struct.pack("<8f8fii", 1, 0, 0, 0, 0, -1, 0, 0, *([0.0] * 8), 0x80, 1)
+           + struct.pack("<8f8fii", 1, 0, 0, 0, 0, -1, 0, 0, *sum(LIGHTMAP_VECS, ()), 0, 0)
+           + struct.pack("<8f8fii", 1, 0, 0, 0, 0, -1, 0, 0, *sum(LIGHTMAP_VECS, ()), 0x800, 0),
         7: b"".join(faces),
+        8: bytes(lighting),
         12: b"".join(struct.pack("<2H", *e) for e in edges),
         13: b"".join(struct.pack("<i", s) for s in surfedges),
         14: struct.pack("<9fiii", -H, -H, -H, H, H, H, 0, 0, 0, 0, 0, len(faces)),

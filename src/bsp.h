@@ -2,7 +2,7 @@
 //
 // Decodes records field by field from the publicly documented layout rather
 // than casting raw memory to structs, so it is safe on any alignment/ABI.
-// Covers world geometry (brush faces and displacements); lightmaps,
+// Covers world geometry (brush faces and displacements) and lightmaps;
 // visibility and collision come next.
 #pragma once
 
@@ -22,6 +22,7 @@ enum Lump : int {
     kVertexes = 3,
     kTexInfo = 6,
     kFaces = 7,
+    kLighting = 8,
     kEdges = 12,
     kSurfEdges = 13,
     kModels = 14,
@@ -29,6 +30,7 @@ enum Lump : int {
     kDispVerts = 33,
     kTexDataStringData = 43,
     kTexDataStringTable = 44,
+    kLightingHdr = 53,
     kFacesHdr = 58,
     kLumpCount = 64,
 };
@@ -40,6 +42,10 @@ constexpr uint32_t kSurfTrigger = 0x40;
 constexpr uint32_t kSurfNoDraw = 0x80;
 constexpr uint32_t kSurfHint = 0x100;
 constexpr uint32_t kSurfSkip = 0x200;
+
+// Texinfo flag: each light style has four lightmaps instead of one (flat,
+// then one per bump-map basis direction).
+constexpr uint32_t kSurfBumpLight = 0x800;
 
 struct Plane {
     Vec3 normal;
@@ -111,6 +117,7 @@ struct Map {
     std::vector<Model> models;              // models[0] is the world
     std::vector<DispInfo> dispInfos;
     std::vector<DispVert> dispVerts;
+    std::vector<uint8_t> lighting;          // lightmap samples; faces[i].lightOfs points in
 };
 
 bool load(const uint8_t* data, size_t size, Map& out, std::string* error = nullptr);
@@ -118,6 +125,8 @@ bool load(const uint8_t* data, size_t size, Map& out, std::string* error = nullp
 struct SurfaceVertex {
     Vec3 pos;
     float u, v;          // texture coordinates, normalized by texture size
+    float lu = 0.0f;     // lightmap coordinates in luxels from the face's
+    float lv = 0.0f;     //   lightmap corner; luxel (x, y) is at exactly (x, y)
     float alpha = 0.0f;  // displacements only: texture blend, 0-1
 };
 
@@ -158,5 +167,38 @@ struct Displacement {
 // faces as buildSurfaces; stats->exported counts displacements.
 std::vector<Displacement> buildDisplacements(const Map& map,
                                              SurfaceStats* stats = nullptr);
+
+// One lightmap: (lightmapSize[0] + 1) x (lightmapSize[1] + 1) luxels, row by
+// row, in linear RGB: (r, g, b) * 2^exponent / 255, so above 1 is overbright.
+struct Lightmap {
+    int width = 0, height = 0;
+    std::vector<Vec3> luxels;
+};
+
+// How many light styles light the face (0-4); 0 means it has no lightmap.
+int lightStyleCount(const Face& face);
+
+// Decodes the lightmap of style slot `style` (an index into face.styles,
+// not a style number). For kSurfBumpLight faces `bump` picks 0 = flat or
+// 1-3 = a bump basis direction; other faces only have bump 0.
+bool decodeLightmap(const Map& map, const Face& face, int style, int bump, Lightmap& out);
+
+// Every lit face's first-style, flat lightmap packed into one page, so the
+// renderer can upload a single texture.
+struct LightmapAtlas {
+    struct Rect {
+        int x = 0, y = 0, width = 0, height = 0;  // width 0: the face is unlit
+    };
+    int width = 0, height = 0;
+    std::vector<Vec3> luxels;  // width * height, row by row
+    std::vector<Rect> faces;   // one per map.faces entry
+};
+
+LightmapAtlas buildLightmapAtlas(const Map& map);
+
+// Normalized atlas coordinates of a vertex of face `faceIndex`; meaningless
+// if the face is unlit (its rect has width 0).
+std::array<float, 2> atlasCoords(const LightmapAtlas& atlas, int faceIndex,
+                                 const SurfaceVertex& v);
 
 } // namespace bsp

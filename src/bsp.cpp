@@ -1,6 +1,7 @@
 #include "bsp.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 
@@ -141,23 +142,30 @@ bool faceCorners(const Map& map, const Face& f, std::vector<Vec3>& out) {
     return true;
 }
 
-// Texture projection for one face.
+// Texture and lightmap projection for one face.
 struct Mapping {
     const TexInfo* ti = nullptr;
     int texData = -1;
     float texW = 1.0f, texH = 1.0f;
+    float lightmapMins[2] = {0.0f, 0.0f};
 
-    // Texture coordinates come from the flat base position, so displacement
-    // textures stretch over steep terrain the way they do in the game.
+    // Both are projected from the flat base position. Displacement textures
+    // stretch over steep terrain the way they do in the game, and for the
+    // lightmap it's the same as interpolating the corners' coordinates.
     SurfaceVertex vertex(const Vec3& pos, const Vec3& base) const {
-        return {pos, (dot(ti->textureVecs[0], base) + ti->textureVecs[0][3]) / texW,
-                (dot(ti->textureVecs[1], base) + ti->textureVecs[1][3]) / texH};
+        SurfaceVertex v{pos, (dot(ti->textureVecs[0], base) + ti->textureVecs[0][3]) / texW,
+                        (dot(ti->textureVecs[1], base) + ti->textureVecs[1][3]) / texH};
+        v.lu = dot(ti->lightmapVecs[0], base) + ti->lightmapVecs[0][3] - lightmapMins[0];
+        v.lv = dot(ti->lightmapVecs[1], base) + ti->lightmapVecs[1][3] - lightmapMins[1];
+        return v;
     }
 };
 
-Mapping faceMapping(const Map& map, const TexInfo& ti) {
+Mapping faceMapping(const Map& map, const Face& f, const TexInfo& ti) {
     Mapping m;
     m.ti = &ti;
+    m.lightmapMins[0] = float(f.lightmapMins[0]);
+    m.lightmapMins[1] = float(f.lightmapMins[1]);
     if (ti.texData >= 0 && size_t(ti.texData) < map.texDatas.size()) {
         const TexData& td = map.texDatas[size_t(ti.texData)];
         m.texData = ti.texData;
@@ -166,6 +174,16 @@ Mapping faceMapping(const Map& map, const TexInfo& ti) {
     }
     return m;
 }
+
+// ColorRGBExp32: an 8-bit color sharing one signed power-of-two exponent.
+Vec3 decodeLuxel(const uint8_t* p) {
+    const float scale = std::ldexp(1.0f / 255.0f, int8_t(p[3]));
+    return {p[0] * scale, p[1] * scale, p[2] * scale};
+}
+
+// Far beyond anything a map compiler emits; keeps corrupt sizes from
+// overflowing the offset math below.
+constexpr int64_t kMaxLightmapDim = 1024;
 
 // The direction the face is seen from.
 Vec3 frontNormal(const Map& map, const Face& f) {
@@ -234,6 +252,13 @@ bool load(const uint8_t* data, size_t size, Map& map, std::string* error) {
     if (!ok) return false;
     if (map.models.empty()) return fail(error, "map has no models (no world)");
 
+    // Each faces lump has its own lighting lump for lightOfs to point into:
+    // LDR faces use the LDR samples, HDR-only maps the HDR ones.
+    const int lightLump = faceLump == kFacesHdr ? kLightingHdr : kLighting;
+    if (l.packedSize[lightLump] != 0)
+        return fail(error, "lump " + std::to_string(lightLump) + " is compressed (not supported yet)");
+    map.lighting.assign(data + l.ofs[lightLump], data + l.ofs[lightLump] + l.len[lightLump]);
+
     // Material names: texdata -> string table -> offset into the string blob.
     const char* strings = reinterpret_cast<const char*>(data + l.ofs[kTexDataStringData]);
     const size_t stringsLen = l.len[kTexDataStringData];
@@ -277,7 +302,7 @@ std::vector<Surface> buildSurfaces(const Map& map, int modelIndex, SurfaceStats*
         if (ti.flags & kHidden) { ++st.toolOrSky; continue; }
         if (!faceCorners(map, f, corners)) { ++st.invalid; continue; }
 
-        const Mapping mapping = faceMapping(map, ti);
+        const Mapping mapping = faceMapping(map, f, ti);
         Surface s;
         s.faceIndex = int(fi);
         s.texData = mapping.texData;
@@ -334,7 +359,7 @@ std::vector<Displacement> buildDisplacements(const Map& map, SurfaceStats* stats
         }
         std::rotate(corners.begin(), corners.begin() + std::ptrdiff_t(first), corners.end());
 
-        const Mapping mapping = faceMapping(map, ti);
+        const Mapping mapping = faceMapping(map, f, ti);
         Displacement d;
         d.faceIndex = int(info.mapFace);
         d.texData = mapping.texData;
@@ -388,6 +413,96 @@ std::vector<Displacement> buildDisplacements(const Map& map, SurfaceStats* stats
 
     if (stats) *stats = st;
     return out;
+}
+
+int lightStyleCount(const Face& face) {
+    if (face.lightOfs < 0) return 0;
+    int n = 0;
+    while (n < 4 && face.styles[n] != 255) ++n;
+    return n;
+}
+
+bool decodeLightmap(const Map& map, const Face& face, int style, int bump, Lightmap& out) {
+    out = Lightmap{};
+    if (face.texInfo < 0 || size_t(face.texInfo) >= map.texInfos.size()) return false;
+    const int bumps = (map.texInfos[size_t(face.texInfo)].flags & kSurfBumpLight) ? 4 : 1;
+    const int64_t w = int64_t(face.lightmapSize[0]) + 1, h = int64_t(face.lightmapSize[1]) + 1;
+    if (style < 0 || style >= lightStyleCount(face) || bump < 0 || bump >= bumps || w < 1 ||
+        h < 1 || w > kMaxLightmapDim || h > kMaxLightmapDim)
+        return false;
+
+    // Per style: the flat lightmap, then (bump-lit faces) the three bump ones.
+    // The styles' average colors sit just before lightOfs and are skipped.
+    const uint64_t count = uint64_t(w * h);
+    const uint64_t start = uint64_t(face.lightOfs) + (uint64_t(style) * bumps + bump) * count * 4;
+    if (start + count * 4 > map.lighting.size()) return false;
+
+    out.width = int(w);
+    out.height = int(h);
+    out.luxels.reserve(count);
+    for (uint64_t i = 0; i < count; ++i)
+        out.luxels.push_back(decodeLuxel(map.lighting.data() + start + i * 4));
+    return true;
+}
+
+LightmapAtlas buildLightmapAtlas(const Map& map) {
+    LightmapAtlas atlas;
+    atlas.faces.resize(map.faces.size());
+
+    std::vector<std::pair<size_t, Lightmap>> lit;
+    uint64_t area = 0;
+    int widest = 0;
+    for (size_t i = 0; i < map.faces.size(); ++i) {
+        Lightmap lm;
+        if (!decodeLightmap(map, map.faces[i], 0, 0, lm)) continue;
+        area += uint64_t(lm.width) * uint64_t(lm.height);
+        widest = std::max(widest, lm.width);
+        lit.emplace_back(i, std::move(lm));
+    }
+    if (lit.empty()) return atlas;
+
+    // Shelf packing, tallest first, into a power-of-two width near sqrt(area).
+    std::stable_sort(lit.begin(), lit.end(), [](const auto& a, const auto& b) {
+        return a.second.height > b.second.height;
+    });
+    int width = 1;
+    while (uint64_t(width) * uint64_t(width) < area) width *= 2;
+    width = std::max(width, widest);
+
+    int x = 0, y = 0, shelf = 0;
+    for (const auto& [face, lm] : lit) {
+        if (x + lm.width > width) {
+            x = 0;
+            y += shelf;
+            shelf = 0;
+        }
+        atlas.faces[face] = {x, y, lm.width, lm.height};
+        x += lm.width;
+        shelf = std::max(shelf, lm.height);
+    }
+    atlas.width = width;
+    atlas.height = y + shelf;
+
+    atlas.luxels.assign(size_t(atlas.width) * size_t(atlas.height), Vec3{0.0f, 0.0f, 0.0f});
+    for (const auto& [face, lm] : lit) {
+        const LightmapAtlas::Rect& r = atlas.faces[face];
+        for (int row = 0; row < lm.height; ++row) {
+            const auto src = lm.luxels.begin() + std::ptrdiff_t(row) * lm.width;
+            std::copy(src, src + lm.width,
+                      atlas.luxels.begin() + std::ptrdiff_t(r.y + row) * atlas.width + r.x);
+        }
+    }
+    return atlas;
+}
+
+std::array<float, 2> atlasCoords(const LightmapAtlas& atlas, int faceIndex,
+                                 const SurfaceVertex& v) {
+    if (faceIndex < 0 || size_t(faceIndex) >= atlas.faces.size() || atlas.width == 0)
+        return {0.0f, 0.0f};
+    const LightmapAtlas::Rect& r = atlas.faces[size_t(faceIndex)];
+    // Luxel (x, y) is sampled at the center of its texel.
+    return {(float(r.x) + v.lu + 0.5f) / float(atlas.width),
+            (float(r.y) + v.lv + 0.5f) / float(atlas.height)};
 }
 
 } // namespace bsp

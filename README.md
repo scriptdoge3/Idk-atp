@@ -17,9 +17,11 @@ for GoldSrc: a new engine that reads the original game's files.
 
     src/vpk.*         VPK v1/v2 archive reader
     src/filesystem.*  search paths: loose files, then VPKs, case-insensitive
-    src/bsp.*         BSP v19/v20 loader + world polygon builder
+    src/bsp.*         BSP v19/v20 loader: world polygons, displacements,
+                      lightmaps and a lightmap atlas
     tools/vpktool     list / extract / CRC-verify VPKs
-    tools/bsp2obj     export a map's world geometry to OBJ for Blender
+    tools/bsp2obj     export a map's world geometry to OBJ for Blender,
+                      with -l to preview its lightmaps instead of textures
     tests/run.sh      builds everything and runs the synthetic-data tests
 
 ## Try it on your install
@@ -28,11 +30,30 @@ for GoldSrc: a new engine that reads the original game's files.
     ./build/bsp2obj -g "$HOME/.local/share/Steam/steamapps/common/Half-Life 2/hl2" \
         maps/d1_trainstation_01.bsp trainstation.obj
 
+Add `-l` to get `trainstation_lightmap.tga` and UVs into it instead of the
+textures, so the baked lighting shows up in Blender.
+
+## Still to confirm on real maps
+
+These follow the format docs but haven't been checked against the game's
+own data yet. A map with terrain, such as `maps/d2_coast_01.bsp`, covers
+all three:
+
+- **Displacement grid layout.** bsp2obj prints the widest gap between sewn
+  neighboring displacements. It should be close to 0; a wide gap (a
+  transposed grid opens the test seam by 64 units) means the layout is wrong.
+- **Displacement lightmaps** are projected from the flat base face, the
+  same as interpolating its corners' luxel coordinates. With `-l`, shadows
+  on terrain should line up with the objects casting them.
+- **Displacement triangle diagonals** alternate in a checkerboard. Compare
+  the phase with `mat_wireframe 1` in the game before collision relies on it.
+
 ## Roadmap
 
 Engine:
 - [x] VPK, filesystem, BSP geometry
-- [ ] Displacements, lightmaps
+- [x] Displacements, lightmaps (all styles and bump maps decode; the atlas
+      holds each face's first style, flat)
 - [ ] VTF textures and VMT materials
 - [ ] Vulkan renderer (desktop first, then Android)
 - [ ] Brush collision and player movement tuned to match the real game

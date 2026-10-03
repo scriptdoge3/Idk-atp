@@ -4,7 +4,13 @@
 Deliberately awkward so the loader has to get things right: faces use a mix
 of positive and negative surfedges, windings are stored in inconsistent
 directions, the ceiling uses side=1 on an outward plane, and there's one
-nodraw face and one displacement face that must be skipped.
+nodraw face that must be skipped.
+
+Two displacement patches float above the floor, sharing the edge x = 0.
+They're stored with opposite windings and start their grids at different
+corners; both sample one height field, so a correct loader closes the seam.
+A third dispinfo points at a face that isn't a displacement and must be
+rejected.
 """
 import struct
 import sys
@@ -18,10 +24,32 @@ ROOM = [  # (plane normal, dist, side, corners) - corners in arbitrary loop orde
     ((0, 1, 0), -H, 0, [(-H, -H, -H), (H, -H, -H), (H, -H, H), (-H, -H, H)]),
     ((0, -1, 0), -H, 0, [(-H, H, -H), (-H, H, H), (H, H, H), (H, H, -H)]),
 ]
-EXTRA = [  # (texinfo, dispinfo) for faces that must be skipped
-    (1, -1),  # nodraw
-    (0, 0),   # displacement
+DISP_POWER = 2
+DISP_Z = -32.0
+DISPS = [  # (corners in stored order, index of the corner the grid starts at, reverse_edges)
+    ([(-32, -16, DISP_Z), (-32, 16, DISP_Z), (0, 16, DISP_Z), (0, -16, DISP_Z)], 2, False),
+    ([(0, -16, DISP_Z), (32, -16, DISP_Z), (32, 16, DISP_Z), (0, 16, DISP_Z)], 1, True),
 ]
+
+
+def disp_height(x, y):
+    """Offset straight up from the base face; asymmetric so a transposed grid shows."""
+    return 12.0 + 0.25 * x + y * y / 64.0
+
+
+def lerp(a, b, t):
+    return tuple(p + (q - p) * t for p, q in zip(a, b))
+
+
+def disp_grid(corners, start):
+    """Base positions row by row: corners rotated to start, then
+    lerp(lerp(c0, c1, r/n), lerp(c3, c2, r/n), c/n)."""
+    c = corners[start:] + corners[:start]
+    n = 1 << DISP_POWER
+    for r in range(n + 1):
+        a, b = lerp(c[0], c[1], r / n), lerp(c[3], c[2], r / n)
+        for col in range(n + 1):
+            yield r, col, lerp(a, b, col / n)
 
 
 def main():
@@ -48,9 +76,26 @@ def main():
 
     for i, (normal, dist, side, corners) in enumerate(ROOM):
         add_face(normal, dist, side, corners, 0, -1, reverse_edges=(i % 2 == 1))
-    quad = [(-8, -8, 0), (8, -8, 0), (8, 8, 0), (-8, 8, 0)]
-    for texinfo, dispinfo in EXTRA:
-        add_face((0, 0, 1), 0.0, 0, quad, texinfo, dispinfo, reverse_edges=False)
+    nodraw_face = len(faces)
+    add_face((0, 0, 1), 0.0, 0, [(-8, -8, 0), (8, -8, 0), (8, 8, 0), (-8, 8, 0)], 1, -1,
+             reverse_edges=False)
+
+    dispinfos, dispverts = [], []
+    for i, (corners, start, reverse) in enumerate(DISPS):
+        map_face = len(faces)
+        add_face((0, 0, 1), DISP_Z, 0, corners, 0, i, reverse_edges=reverse)
+        # startPosition is the grid's first corner, nudged off it a little.
+        start_pos = (corners[start][0] + 0.5, corners[start][1] - 0.25, DISP_Z + 0.1)
+        dispinfos.append((start_pos, len(dispverts), map_face))
+        n = 1 << DISP_POWER
+        for r, _, (x, y, _) in disp_grid(corners, start):
+            dispverts.append(struct.pack("<3fff", 0, 0, 1, disp_height(x, y), 255.0 * r / n))
+    dispinfos.append(((0, 0, 0), 0, nodraw_face))  # its face isn't a displacement
+
+    def pack_dispinfo(start_pos, vert_start, map_face):
+        head = struct.pack("<3fiiiifiH2xii", *start_pos, vert_start, 0, DISP_POWER, 0, 0.0, 1,
+                           map_face, 0, 0)
+        return head + bytes(176 - len(head))  # neighbor tables and allowed verts unused
 
     names = [b"test/concrete01", b"test/nodraw"]
     string_data, string_table = b"", []
@@ -71,6 +116,8 @@ def main():
         12: b"".join(struct.pack("<2H", *e) for e in edges),
         13: b"".join(struct.pack("<i", s) for s in surfedges),
         14: struct.pack("<9fiii", -H, -H, -H, H, H, H, 0, 0, 0, 0, 0, len(faces)),
+        26: b"".join(pack_dispinfo(*d) for d in dispinfos),
+        33: b"".join(dispverts),
         43: string_data,
         44: b"".join(struct.pack("<i", o) for o in string_table),
     }

@@ -2,8 +2,8 @@
 //
 // Decodes records field by field from the publicly documented layout rather
 // than casting raw memory to structs, so it is safe on any alignment/ABI.
-// Currently covers what's needed to build world geometry; lightmaps,
-// displacements, visibility and collision come next.
+// Covers world geometry (brush faces and displacements); lightmaps,
+// visibility and collision come next.
 #pragma once
 
 #include <array>
@@ -25,6 +25,8 @@ enum Lump : int {
     kEdges = 12,
     kSurfEdges = 13,
     kModels = 14,
+    kDispInfo = 26,
+    kDispVerts = 33,
     kTexDataStringData = 43,
     kTexDataStringTable = 44,
     kFacesHdr = 58,
@@ -80,6 +82,20 @@ struct Model {
     int32_t headNode, firstFace, numFaces;
 };
 
+// A displacement replaces one four-sided face with a grid of offset vertices.
+struct DispInfo {
+    Vec3 startPosition;     // the grid starts at the base face corner nearest this
+    int32_t dispVertStart;  // index of this displacement's first DispVert
+    int32_t power;          // grid is (2^power + 1)^2 vertices; 2, 3 or 4 in practice
+    uint16_t mapFace;       // the face being replaced
+};
+
+struct DispVert {
+    Vec3 vec;     // unit direction from the flat base position to the vertex
+    float dist;   // distance along vec
+    float alpha;  // blend between the material's two textures, 0-255
+};
+
 struct Map {
     int version = 0;
     bool hdrFacesOnly = false;  // faces came from the HDR faces lump
@@ -93,13 +109,16 @@ struct Map {
     std::vector<TexData> texDatas;
     std::vector<std::string> texDataNames;  // material path for each texDatas[i]
     std::vector<Model> models;              // models[0] is the world
+    std::vector<DispInfo> dispInfos;
+    std::vector<DispVert> dispVerts;
 };
 
 bool load(const uint8_t* data, size_t size, Map& out, std::string* error = nullptr);
 
 struct SurfaceVertex {
     Vec3 pos;
-    float u, v;  // texture coordinates, normalized by texture size
+    float u, v;          // texture coordinates, normalized by texture size
+    float alpha = 0.0f;  // displacements only: texture blend, 0-1
 };
 
 // One convex polygon, wound counter-clockwise when seen from its front side.
@@ -116,8 +135,28 @@ struct SurfaceStats {
 };
 
 // Visible polygons of one brush model (0 = world). Skips sky, tool and
-// trigger faces, and displacements (not supported yet).
+// trigger faces, and displacement faces (see buildDisplacements).
 std::vector<Surface> buildSurfaces(const Map& map, int modelIndex = 0,
                                    SurfaceStats* stats = nullptr);
+
+// One displacement as an indexed triangle mesh. The base face's corners are
+// taken in stored order, starting from the one nearest startPosition, and
+// vertex (row r, column c) of the n x n-quad grid sits at
+//     lerp(lerp(c0, c1, r / n), lerp(c3, c2, r / n), c / n) + vec * dist
+// Triangles are wound counter-clockwise seen from the face's front, and the
+// grid's quads are split along alternating diagonals.
+struct Displacement {
+    int faceIndex;
+    int texData;                          // -1 if the face has no valid texdata
+    int power;                            // n = 2^power quads per side
+    std::array<Vec3, 4> corners;          // c0..c3 of the flat base face
+    std::vector<SurfaceVertex> vertices;  // (n + 1)^2, row by row
+    std::vector<uint32_t> indices;        // three per triangle
+};
+
+// Every visible displacement, in dispinfo order. Skips the same sky and tool
+// faces as buildSurfaces; stats->exported counts displacements.
+std::vector<Displacement> buildDisplacements(const Map& map,
+                                             SurfaceStats* stats = nullptr);
 
 } // namespace bsp

@@ -27,6 +27,7 @@ python3 tests/make_test_bsp.py "$G/MAPS/Room.BSP" > /dev/null
 ./build/fs_test "$G"
 
 echo "== bsp =="
+./build/bsp_test "$G/MAPS/Room.BSP"
 ./build/bsp2obj -g "$G" maps/room.bsp "$T/room.obj"
 python3 tests/check_obj.py "$T/room.obj"
 echo "all tests passed"
